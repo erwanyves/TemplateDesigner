@@ -1,0 +1,68 @@
+# -*- coding: utf-8 -*-
+# Auteur  : Yves Guillou
+# Licence : LGPL-2.1 — voir le fichier LICENSE du dépôt
+"""TemplateDesigner — éditeur de templates (fonds de plan) pour TechDraw.
+
+Placer ce fichier dans le répertoire Macro de FreeCAD ; le dossier
+`TemplateDesigner/` doit se trouver dans le même répertoire.
+
+Usage : lancer la macro, sans sélection. Elle ouvre une fenêtre d'édition et
+propose de partir d'un template livré avec FreeCAD, d'un de vos templates ou
+d'un template neuf. Rien n'est écrit dans un document FreeCAD tant que vous
+ne choisissez pas « Appliquer à une page TechDraw ».
+"""
+
+__version__ = "0.2.2"
+
+import importlib
+import os
+import sys
+
+import FreeCAD
+
+_NOM = 'TemplateDesigner'
+
+
+def _dossier_macro():
+    """Dossier Macro de l'utilisateur. `__file__` n'existe pas sous exec()."""
+    base = FreeCAD.getUserMacroDir(True)
+    if base:
+        return base
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+def _preparer_import(macro_dir):
+    """Dossier Macro en TÊTE de sys.path, paquet purgé du cache.
+
+    Toutes les occurrences sont retirées puis une seule est réinsérée en tête :
+    depuis FreeCAD 1.2 / 26.x, le dossier Macro PAR VERSION précède celui-ci
+    sur sys.path et peut porter une ancienne copie du paquet (SpringFull,
+    11/10/2026). La purge par préfixe POINTÉ ne touche que ce paquet et
+    rend le rechargement insensible à l'ajout d'un module.
+    """
+    while macro_dir in sys.path:
+        sys.path.remove(macro_dir)
+    sys.path.insert(0, macro_dir)
+    prefixe = _NOM + '.'
+    for nom in [n for n in list(sys.modules)
+                if n == _NOM or n.startswith(prefixe)]:
+        del sys.modules[nom]
+
+
+def main():
+    macro_dir = _dossier_macro()
+    if not os.path.isdir(os.path.join(macro_dir, _NOM)):
+        FreeCAD.Console.PrintError(
+            '%s : dossier introuvable -> %s\n'
+            'Vérifiez que le dossier %s/ est placé dans votre répertoire '
+            'Macro.\n' % (_NOM, os.path.join(macro_dir, _NOM), _NOM))
+        return None
+    _preparer_import(macro_dir)
+    dialogue = importlib.import_module(_NOM + '.dialogue')
+    return dialogue.lancer()
+
+
+main()
