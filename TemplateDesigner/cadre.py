@@ -33,6 +33,8 @@ sous ces identifiants : c'est le cas des templates ISO 5457 de FreeCAD et de
 ceux que produit ce module. Tout le reste est le cartouche.
 """
 
+import math
+import re
 from xml.dom import minidom
 
 from . import metier
@@ -417,32 +419,222 @@ def _retirer_avec_blanc(element):
     element.unlink()
 
 
-def changer_format(gabarit, nom, paysage):
+# --------------------------------------------------------------------------
+# Famille : un template décliné de A4 à A0
+# --------------------------------------------------------------------------
+
+_RE_FAMILLE = re.compile(r'^A[0-4]_(?:Portrait|Landscape)(.*)$', re.I)
+
+
+def formats_famille():
+    """Les dix formats d'une famille : A4 à A0, portrait puis paysage."""
+    return [(nom, paysage) for nom, _p, _g in FORMATS
+            for paysage in (False, True)]
+
+
+def suffixe_famille(nom_fichier):
+    """Ce qui suit le format dans un nom de template (`A4_Portrait-J3D` →
+    `-J3D`) ; un nom qui ne commence pas par un format A4…A0 est gardé
+    entier, précédé de `_`."""
+    trouve = _RE_FAMILLE.match(nom_fichier)
+    if trouve:
+        return trouve.group(1)
+    return '_' + nom_fichier if nom_fichier else ''
+
+
+def nom_fichier_famille(suffixe, nom, paysage):
+    """Nom du fichier d'un format, à la manière des templates de FreeCAD."""
+    return '%s_%s%s.svg' % (nom, 'Landscape' if paysage else 'Portrait',
+                            suffixe)
+
+
+def changer_format(gabarit, nom, paysage, mesurer=None):
+    """Transpose un template STRUCTURÉ vers un autre format (`transposer`) ;
+    rend la liste des éléments qui débordent, comme avant la 0.2.5."""
+    return transposer(gabarit, nom, paysage, mesurer)['debordements']
+
+
+def transposer(gabarit, nom, paysage, mesurer=None):
     """Transpose un template STRUCTURÉ vers un autre format.
 
-    Le cadre est reconstruit aux cotes du format ; tout ce qui n'est pas le
-    cadre suit le coin bas-droit du cadre du dessin. Rend la liste des
-    identifiants des éléments du cartouche qui débordent du nouveau cadre
-    (vide si tout tient) : rien n'est corrigé, c'est à l'appelant de le dire.
+    Le cadre est reconstruit aux cotes du format. Ce qui est DANS le cadre du
+    dessin (cartouche, logos) suit son coin bas-droit. Ce qui est dans une
+    MARGE (hors du cadre) y reste : même distance au bord de la feuille, même
+    distance au bout du cadre le plus proche le long de la marge.
+
+    `mesurer(texte)` rend la longueur d'un texte dans ses propres unités, à
+    sa taille actuelle (l'appelant la mesure avec la police) ; quand elle est
+    donnée, un texte de marge plus long que la place disponible — la longueur
+    du cadre moins son écart au bout, laissé aussi à l'autre bout — est réduit
+    juste assez pour l'occuper, son bout le plus proche du cadre restant en
+    place. Rien n'est réduit sans mesure.
+
+    Rend {'debordements': [...], 'marges': [...], 'reductions': [(nom,
+    taille avant, taille après)]} : rien n'est corrigé d'autre que la taille
+    déclarée, c'est à l'appelant de le dire.
     """
     p = lire_parametres(gabarit)
     largeur, hauteur = dimensions(nom, paysage)
     ancien_x, ancien_y, _structure = coin_cartouche(gabarit)
+    ancien_cadre = metier.boite_page(_rect_cadre(gabarit))
+    ancienne_feuille = gabarit.taille_mm()
     defaut = parametres_par_defaut(nom)
     for cle in ('centrage_bas', 'reperes_complets'):
         p[cle] = defaut[cle]
     p['designation'] = nom if p['grille'] else ''
-    dx = (largeur - p['marge_droite']) - ancien_x
-    dy = (hauteur - p['marge_bas']) - ancien_y
+    nouveau_cadre = (p['marge_gauche'], p['marge_haut'],
+                     largeur - p['marge_droite'], hauteur - p['marge_bas'])
+    dx = nouveau_cadre[2] - ancien_x
+    dy = nouveau_cadre[3] - ancien_y
+    # tout relever avant de rien déplacer
+    dedans, marges = [], []
     for element in elements_cartouche(gabarit):
+        point = _point_marge(element)
+        cote = None if point is None else cote_marge(ancien_cadre, point)
+        if cote is None:
+            dedans.append(element)
+        else:
+            longueur = (mesurer(element) if mesurer is not None
+                        and metier.nom_local(element) == 'text' else None)
+            marges.append((element, cote, longueur))
+    for element in dedans:
         metier.deplacer(element, dx, dy)
+    reductions = []
+    places = []      # (élément, longueur APRÈS réduction) — par identité
+    for element, cote, longueur in marges:
+        reduction = _placer_marge(gabarit, element, cote, longueur,
+                                  ancien_cadre, nouveau_cadre,
+                                  ancienne_feuille, (largeur, hauteur))
+        if reduction is not None:
+            reductions.append((_nommer(element),) + reduction)
+            longueur = longueur * reduction[1] / reduction[0]
+        places.append((element, longueur))
     remplacer_cadre(gabarit, largeur, hauteur, p)
     gabarit.definir_taille(largeur, hauteur)
-    return debordements(gabarit)
+    hors_feuille = []
+    for element, longueur in places:
+        boite = _etendue(element, longueur)
+        if boite is not None and (
+                boite[0] < -_TOLERANCE_MARGE or boite[1] < -_TOLERANCE_MARGE
+                or boite[2] > largeur + _TOLERANCE_MARGE
+                or boite[3] > hauteur + _TOLERANCE_MARGE):
+            hors_feuille.append(_nommer(element))
+    return {
+        'debordements': debordements(
+            gabarit, exclus=[e for e, _c, _l in marges]) + hors_feuille,
+        'marges': [_nommer(e) for e, _c, _l in marges],
+        'reductions': reductions,
+    }
 
 
-def debordements(gabarit):
-    """Identifiants des éléments du cartouche qui sortent du cadre du dessin."""
+# --------------------------------------------------------------------------
+# Éléments de marge
+# --------------------------------------------------------------------------
+
+_TOLERANCE_MARGE = 0.01
+
+
+def _nommer(element):
+    return element.getAttribute('id') or metier.nom_local(element)
+
+
+def _point_marge(element):
+    """Point qui décide si un élément est dans une marge : là où commencent
+    les glyphes d'un texte, le centre de la boîte des autres ; None sans
+    géométrie connue."""
+    if metier.nom_local(element) == 'text':
+        x, y = metier._pivot_texte(element)
+        return metier.appliquer(metier.matrice_totale(element), x, y)
+    boite = metier.boite_page(element)
+    if boite is None:
+        return None
+    return ((boite[0] + boite[2]) / 2.0, (boite[1] + boite[3]) / 2.0)
+
+
+def cote_marge(cadre, point):
+    """'gauche', 'haut', 'droite' ou 'bas' : la marge où se trouve le point
+    (celle qu'il dépasse le plus) ; None s'il est dans le cadre."""
+    x0, y0, x1, y1 = cadre
+    x, y = point
+    cote, exces = max((('gauche', x0 - x), ('haut', y0 - y),
+                       ('droite', x - x1), ('bas', y - y1)),
+                      key=lambda couple: couple[1])
+    return cote if exces > _TOLERANCE_MARGE else None
+
+
+def _etendue(element, longueur):
+    """Boîte de l'élément dans la page ; pour un texte dont la longueur est
+    connue, celle de sa ligne de base entière (l'ancrage `text-anchor`
+    compris), sinon son seul point d'ancrage."""
+    if metier.nom_local(element) != 'text' or longueur is None:
+        return metier.boite_page(element)
+    x, y = metier._pivot_texte(element)
+    ancre = metier.propriete_heritee(element, 'text-anchor') or 'start'
+    depart = {'middle': -longueur / 2.0, 'end': -longueur}.get(ancre, 0.0)
+    m = metier.matrice_totale(element)
+    return metier.boite([metier.appliquer(m, x + depart, y),
+                         metier.appliquer(m, x + depart + longueur, y)])
+
+
+def _placer_marge(gabarit, element, cote, longueur, ancien_cadre,
+                  nouveau_cadre, ancienne_feuille, nouvelle_feuille):
+    """Replace un élément de marge ; rend (taille avant, après) s'il a fallu
+    réduire un texte, sinon None."""
+    boite = _etendue(element, longueur)
+    if boite is None:
+        return None
+    vertical = cote in ('gauche', 'droite')     # la marge court verticalement
+    axe = 1 if vertical else 0
+    # perpendiculairement : même distance au bord de la feuille qu'il borde
+    if cote in ('droite', 'bas'):
+        ecart_bord = nouvelle_feuille[1 - axe] - ancienne_feuille[1 - axe]
+    else:
+        ecart_bord = 0.0
+    c0, c1 = ancien_cadre[axe], ancien_cadre[axe + 2]
+    n0, n1 = nouveau_cadre[axe], nouveau_cadre[axe + 2]
+    debut, fin = boite[axe], boite[axe + 2]
+    ecart_debut, ecart_fin = debut - c0, c1 - fin
+    # le bout le plus proche est celui de plus petit écart POSITIF : un écart
+    # négatif (l'élément dépasse déjà ce bout) ne l'ancre pas ; s'il dépasse
+    # des deux côtés, le moindre dépassement l'emporte (relecture
+    # indépendante, 19/11/2026 : texte trop long resté en haut des grandes
+    # feuilles)
+    au_debut = ((ecart_debut < 0, abs(ecart_debut))
+                <= (ecart_fin < 0, abs(ecart_fin)))
+    ecart = ecart_debut if au_debut else ecart_fin
+    le_long = (n0 - c0) if au_debut else (n1 - c1)
+    _deplacer_axes(element, vertical, ecart_bord, le_long)
+    if longueur is None:
+        return None
+    disponible = (n1 - n0) - 2.0 * max(ecart, 0.0)
+    etendue = fin - debut
+    if disponible <= 0 or etendue <= disponible + 1e-9:
+        return None
+    avant = gabarit.taille_police(element)
+    if not avant:
+        return None
+    # arrondie VERS LE BAS à l'écriture (6 décimales) : le texte tient
+    apres = math.floor(avant * disponible / etendue * 1e6) / 1e6
+    gabarit.definir_taille_police(element, apres)
+    boite = _etendue(element, longueur * apres / avant)
+    if au_debut:
+        retour = (n0 + max(ecart, 0.0)) - boite[axe]
+    else:
+        retour = (n1 - max(ecart, 0.0)) - boite[axe + 2]
+    _deplacer_axes(element, vertical, 0.0, retour)
+    return (avant, apres)
+
+
+def _deplacer_axes(element, vertical, perpendiculaire, le_long):
+    if vertical:
+        metier.deplacer_page(element, perpendiculaire, le_long)
+    else:
+        metier.deplacer_page(element, le_long, perpendiculaire)
+
+
+def debordements(gabarit, exclus=()):
+    """Identifiants des éléments du cartouche qui sortent du cadre du dessin ;
+    `exclus` : éléments placés exprès hors du cadre (marges)."""
     rect = _rect_cadre(gabarit)
     if rect is None:
         return []
@@ -450,6 +642,8 @@ def debordements(gabarit):
     tolerance = 0.01
     dehors = []
     for element in elements_cartouche(gabarit):
+        if any(element is autre for autre in exclus):
+            continue
         boite = metier.boite_page(element)
         if boite is None:
             continue

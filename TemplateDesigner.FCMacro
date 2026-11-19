@@ -12,7 +12,7 @@ d'un template neuf. Rien n'est écrit dans un document FreeCAD tant que vous
 ne choisissez pas « Appliquer à une page TechDraw ».
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.5"
 
 import importlib
 import os

@@ -25,6 +25,7 @@ traduit rien et ne dépend pas de l'interface.
 """
 
 import base64
+import binascii
 import math
 import re
 from xml.dom import minidom
@@ -689,6 +690,183 @@ def deplacer_page(element, dx, dy):
     deplacer(element,
              inverse[0] * dx + inverse[2] * dy,
              inverse[1] * dx + inverse[3] * dy)
+
+
+# --------------------------------------------------------------------------
+# Textes : orientation
+# --------------------------------------------------------------------------
+#
+# L'angle se donne en degrés, dans le sens trigonométrique TEL QU'ON LE VOIT
+# sur la page (90 = texte qui se lit de bas en haut, -90 = de haut en bas),
+# comme les angles de FreeCAD. Le SVG compte à l'inverse (axe y vers le
+# bas) : `rotate(a)` tourne dans le sens horaire à l'écran.
+
+_TOLERANCE_ROTATION = 1e-6
+
+
+def _similitude(m):
+    """Angle SVG (degrés) d'une matrice rotation × échelle uniforme, et son
+    échelle ; None si elle porte un biais, un miroir ou une échelle inégale."""
+    echelle = math.hypot(m[0], m[1])
+    if echelle < 1e-12:
+        return None
+    if (abs(m[0] - m[3]) > _TOLERANCE_ROTATION * echelle
+            or abs(m[1] + m[2]) > _TOLERANCE_ROTATION * echelle):
+        return None
+    return math.degrees(math.atan2(m[1], m[0])), echelle
+
+
+def _normaliser_angle(angle):
+    """Angle ramené dans ]-180, 180], sans -0 ni bruit d'arrondi."""
+    angle = math.fmod(angle, 360.0)
+    if angle <= -180.0:
+        angle += 360.0
+    elif angle > 180.0:
+        angle -= 360.0
+    angle = round(angle, 9)
+    return 180.0 if angle == -180.0 else angle + 0.0
+
+
+def angle_texte(element):
+    """Orientation du texte DANS LA PAGE (convention ci-dessus) ; None quand
+    sa transformation porte un biais, un miroir ou une échelle inégale."""
+    lu = _similitude(matrice_totale(element))
+    if lu is None:
+        return None
+    return _normaliser_angle(-lu[0])
+
+
+def texte_orientable(element):
+    """Vrai si `orienter_texte` accepte ce texte : son `transform` propre et
+    ceux de ses parents ne portent que rotation, translation et échelle
+    uniforme — ni biais, ni miroir, ni échelle inégale."""
+    return (_similitude(matrice_parents(element)) is not None
+            and _similitude(matrice_propre(element)) is not None)
+
+
+def _pivot_texte(element):
+    """Point où commencent les glyphes : les `x`/`y` du premier tspan quand il
+    en porte (ils l'emportent sur ceux du texte), sinon ceux du texte."""
+    x = element.getAttribute('x')
+    y = element.getAttribute('y')
+    tspans = _tspans(element)
+    if tspans:
+        x = tspans[0].getAttribute('x') or x
+        y = tspans[0].getAttribute('y') or y
+    return (nombre(x), nombre(y))
+
+
+def orienter_texte(element, angle):
+    """Oriente le texte de `angle` degrés dans la page, autour du point où
+    commencent ses glyphes, qui ne bouge pas.
+
+    Le `transform` propre du texte est réécrit `translate(…) rotate(a,x,y)` :
+    la translation garde les déplacements déjà faits, la rotation tourne
+    autour du pivot ; une échelle uniforme déjà portée est gardée, autour du
+    même pivot. Refusé (rien n'est écrit) quand le texte ou un parent porte
+    un biais, un miroir ou une échelle inégale : le réécrire le détruirait.
+    """
+    if not texte_orientable(element):
+        raise Refus('err_rotation_transform')
+    parents = _similitude(matrice_parents(element))
+    propre = matrice_propre(element)
+    echelle = _similitude(propre)[1]
+    # rotation propre = voulue dans la page (sens SVG) − celle des parents
+    rotation = _normaliser_angle(-angle - parents[0])
+    px, py = _pivot_texte(element)
+    qx, qy = appliquer(propre, px, py)
+    tx, ty = qx - px, qy - py
+    morceaux = []
+    if fmt(tx) != '0' or fmt(ty) != '0':
+        morceaux.append('translate(%s,%s)' % (fmt(tx), fmt(ty)))
+    if fmt(rotation) != '0':
+        morceaux.append('rotate(%s,%s,%s)' % (fmt(rotation), fmt(px), fmt(py)))
+    if abs(echelle - 1.0) > _TOLERANCE_ROTATION:
+        # échelle autour du pivot : il reste immobile
+        morceaux.append('translate(%s,%s) scale(%s) translate(%s,%s)' % (
+            fmt(px), fmt(py), repr(echelle), fmt(-px), fmt(-py)))
+    if morceaux:
+        element.setAttribute('transform', ' '.join(morceaux))
+    elif element.hasAttribute('transform'):
+        element.removeAttribute('transform')
+
+
+# --------------------------------------------------------------------------
+# Logos : proportions
+# --------------------------------------------------------------------------
+
+_RE_DONNEES = re.compile(r'^\s*data:([^;,]*)((?:;[^;,]*)*),(.*)$', re.S)
+
+
+def donnees_image(element):
+    """(type MIME, octets) d'une image INCORPORÉE en base 64 (`data:…;base64,…`).
+
+    Rend None pour une image liée à un fichier, codée autrement qu'en base 64
+    ou dont le contenu ne se décode pas : ses proportions ne se lisent pas
+    dans le template. Le lien se lit sous `xlink:href` (SVG 1.1, préfixe
+    quelconque) comme sous `href` (SVG 2).
+    """
+    liens = {}
+    attributs = element.attributes
+    for rang in range(attributs.length if attributs is not None else 0):
+        attribut = attributs.item(rang)
+        nom = attribut.name
+        if nom == 'href':
+            liens.setdefault('href', attribut.value)
+        elif nom.split(':')[-1] == 'href':
+            liens.setdefault('xlink', attribut.value)
+    # les deux présents : Qt affiche `xlink:href`, quel que soit leur ordre
+    # (QtSvg 6.12, relecture indépendante du 19/11/2026) ; on lit ce qu'il
+    # affiche
+    lien = liens.get('xlink', liens.get('href'))
+    trouve = _RE_DONNEES.match(lien or '')
+    if trouve is None:
+        return None
+    parametres = [p.strip().lower() for p in trouve.group(2).split(';')]
+    if 'base64' not in parametres:
+        return None
+    donnees = re.sub(r'\s+', '', trouve.group(3))
+    # Qt affiche aussi une image dont le base 64 a perdu ses « = » finaux
+    donnees = donnees + '=' * (-len(donnees) % 4)
+    try:
+        octets = base64.b64decode(donnees, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if not octets:
+        return None
+    return trouve.group(1).strip().lower(), octets
+
+
+_RE_COTE = re.compile(
+    r'^\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\s*([A-Za-z%]*)\s*$')
+
+
+def rapport_cadre(element):
+    """Hauteur / largeur du cadre de l'élément (`width`, `height`), ou None si
+    l'une des deux n'est pas un nombre strictement positif, est en
+    pourcentage, ou si elles ne sont pas dans la même unité : leur rapport
+    n'aurait alors pas de sens."""
+    lues = []
+    for attribut in ('width', 'height'):
+        trouve = _RE_COTE.match(element.getAttribute(attribut))
+        if trouve is None:
+            return None
+        lues.append((float(trouve.group(1)), trouve.group(2).lower()))
+    (largeur, unite_l), (hauteur, unite_h) = lues
+    if unite_l != unite_h or unite_l == '%':
+        return None
+    if not (largeur > 0 and hauteur > 0):
+        return None
+    return hauteur / largeur
+
+
+def cotes_proportionnees(attribut, valeur, rapport):
+    """(largeur, hauteur) quand la cote `attribut` ('width' ou 'height') reçoit
+    `valeur` et que hauteur / largeur doit valoir `rapport` (> 0). La cote
+    reçue est rendue telle quelle."""
+    if attribut == 'width':
+        return valeur, valeur * rapport
+    return valeur / rapport, valeur
 
 
 # --------------------------------------------------------------------------

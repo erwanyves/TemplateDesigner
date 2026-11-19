@@ -27,4 +27,4 @@ La macro ne modifie jamais un template livré avec FreeCAD, et n'écrit dans
 un document ou dans les préférences de TechDraw que sur commande explicite.
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.5"

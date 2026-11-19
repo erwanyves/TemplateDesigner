@@ -47,6 +47,90 @@ def _message_refus(refus):
     return tr(refus.cle, **refus.arguments)
 
 
+def _taille_image(mime, octets):
+    """(largeur, hauteur) propres d'une image, en flottants ; une valeur nulle
+    ou négative si elle ne se lit pas. La même lecture à l'insertion d'un logo
+    et pour en garder les proportions.
+
+    SVG : sa `viewBox`, en flottants — Qt l'étire sur tout le cadre de
+    l'`<image>` (il ignore `preserveAspectRatio`), et `defaultSize()` est
+    arrondi à l'entier (viewBox 1,5 × 1 lue 2 × 1) ; mesuré QtSvg 6.12, le
+    19/11/2026. Autres formats : la taille lue dans l'en-tête, sans décoder
+    l'image (0,5 ms contre 58 ms pour un PNG de 4000 × 3000) ; décodage
+    complet seulement si l'en-tête ne la donne pas.
+    """
+    if mime == 'image/svg+xml':
+        rendu = QtSvg.QSvgRenderer(QtCore.QByteArray(octets))
+        vue = rendu.viewBoxF()
+        if vue.width() > 0 and vue.height() > 0:
+            return vue.width(), vue.height()
+        taille = rendu.defaultSize()
+        return float(taille.width()), float(taille.height())
+    tampon = QtCore.QBuffer()
+    tampon.setData(QtCore.QByteArray(octets))
+    tampon.open(QtCore.QIODevice.ReadOnly)
+    lecteur = QtGui.QImageReader(tampon)
+    taille = lecteur.size()
+    if not (taille.width() > 0 and taille.height() > 0):
+        taille = QtGui.QImage.fromData(octets).size()
+    return float(taille.width()), float(taille.height())
+
+
+def _rapport_logo(element):
+    """(source, rapport hauteur / largeur) à conserver pour un logo.
+
+    'image' : rapport lu dans l'image incorporée ; 'cadre' : l'image n'est
+    pas incorporée ou ne se lit pas, on garde le rapport du cadre actuel ;
+    (None, None) : cadre de largeur ou de hauteur nulle, rien à conserver.
+    """
+    donnees = metier.donnees_image(element)
+    if donnees is not None:
+        largeur, hauteur = _taille_image(*donnees)
+        if largeur > 0 and hauteur > 0:
+            return 'image', hauteur / largeur
+    rapport = metier.rapport_cadre(element)
+    return ('cadre', rapport) if rapport is not None else (None, None)
+
+
+def _mesureur(gabarit):
+    """Longueur d'un texte dans ses propres unités, à sa taille : mesurée
+    avec sa police par Qt (osifont est chargée au lancement), comme la
+    dessine le moteur SVG ; None pour un texte vide ou sans taille."""
+    def mesurer(element):
+        taille = gabarit.taille_police(element)
+        # une ligne par tspan ; les blancs réduits comme au rendu SVG
+        # (QtSvg : suites de blancs → un espace, bords ignorés)
+        lignes = [' '.join(metier._texte_direct(t).split())
+                  for t in metier._tspans(element)] or [
+                      ' '.join(metier.texte_de(element).split())]
+        lignes = [ligne for ligne in lignes if ligne]
+        if not taille or not lignes:
+            return None
+        famille = (metier.propriete_heritee(element, 'font-family')
+                   or 'osifont').split(',')[0].strip().strip('\'"')
+        police = QtGui.QFont(famille)
+        police.setPixelSize(1000)
+        metrique = QtGui.QFontMetricsF(police)
+        largeur = (metrique.horizontalAdvance if hasattr(
+            metrique, 'horizontalAdvance') else metrique.width)
+        return max(largeur(ligne) for ligne in lignes) * taille / 1000.0
+    return mesurer
+
+
+def _lignes_transposition(bilan):
+    """Ce que `cadre.transposer` a fait d'autre que déplacer : textes de
+    marge réduits, éléments qui débordent."""
+    lignes = []
+    for nom, avant, apres in bilan.get('reductions', []):
+        lignes.append(tr('info_reduction', nom=nom, avant=metier.fmt(avant),
+                         apres=metier.fmt(apres)))
+    dehors = bilan.get('debordements', [])
+    if dehors:
+        lignes.append(tr('info_debordement', compte=len(dehors),
+                         liste=', '.join(dehors[:12])))
+    return lignes
+
+
 def _nombre(parent, decimales=3, mini=-_PLAGE, maxi=_PLAGE):
     """Zone numérique. La plage est large exprès : `setRange` écrête sans le
     dire toute valeur qui en sort."""
@@ -154,6 +238,7 @@ class Fenetre(QtWidgets.QMainWindow):
         m = menus.addMenu(tr('menu_template'))
         barre.addSeparator()
         self._action('act_format', self.changer_format, None, m, barre)
+        self._action('act_famille', self.enregistrer_famille, None, m)
         self._action('act_cartouche', self.inserer_cartouche, None, m, barre)
         self._action('act_exporter_cartouche', self.exporter_cartouche,
                      None, m)
@@ -244,6 +329,13 @@ class Fenetre(QtWidgets.QMainWindow):
         self._p_h = ligne('prop_hauteur', _nombre(panneau, 3, 0.001))
         self._p_l.valueChanged.connect(lambda _v: self._appliquer_cote('width'))
         self._p_h.valueChanged.connect(lambda _v: self._appliquer_cote('height'))
+        # case sans geste propre : elle dit comment la PROCHAINE cote tapée
+        # s'applique à un logo ; cochée à chaque ouverture de la fenêtre ;
+        # la basculer ne met à jour que la note du panneau
+        self._p_proportions = ligne('prop_proportions',
+                                    QtWidgets.QCheckBox(''))
+        self._p_proportions.setChecked(True)
+        self._p_proportions.toggled.connect(self._case_proportions)
         self._p_x2 = ligne('prop_x2', _nombre(panneau))
         self._p_y2 = ligne('prop_y2', _nombre(panneau))
         self._p_x2.valueChanged.connect(lambda _v: self._appliquer_bout(2))
@@ -260,6 +352,14 @@ class Fenetre(QtWidgets.QMainWindow):
         for ancre in _ANCRES:
             self._p_ancre.addItem(tr('ancre_' + ancre), ancre)
         self._p_ancre.activated.connect(lambda _r: self._appliquer_ancre())
+        # angle dans la PAGE, sens trigonométrique (90 = le texte monte) ;
+        # le pas de 90° passe d'une orientation courante à l'autre
+        self._p_rotation = ligne('prop_rotation',
+                                 _nombre(panneau, 2, -360.0, 360.0))
+        self._p_rotation.setSuffix(' °')
+        self._p_rotation.setSingleStep(90.0)
+        self._p_rotation.valueChanged.connect(
+            lambda _v: self._appliquer_rotation())
         self._p_trait = ligne('prop_epaisseur', _nombre(panneau, 2, 0.01, 50.0))
         self._p_trait.setSingleStep(0.05)
         self._p_trait.valueChanged.connect(
@@ -477,6 +577,16 @@ class Fenetre(QtWidgets.QMainWindow):
         finally:
             self._remplissage = False
 
+    def _case_proportions(self, _coche):
+        """La case ne modifie pas le logo : elle change la note du panneau."""
+        if self._remplissage:
+            return
+        self._remplissage = True
+        try:
+            self._remplir_proprietes()
+        finally:
+            self._remplissage = False
+
     def _table_change(self):
         if self._remplissage:
             return
@@ -542,9 +652,15 @@ class Fenetre(QtWidgets.QMainWindow):
             cles += ['prop_x', 'prop_y']
             self._p_x.setValue(reference[0])
             self._p_y.setValue(reference[1])
+        rotation_grisee = False
         if nature in ('texte', 'champ'):
             cles += ['prop_texte', 'prop_champ', 'prop_taille', 'prop_police',
-                     'prop_ancre']
+                     'prop_ancre', 'prop_rotation']
+            angle = metier.angle_texte(element)
+            # biais, miroir ou échelle inégale (texte ou parent) : la zone se
+            # grise, l'écriture refuserait (relecture indépendante, 19/11)
+            rotation_grisee = not metier.texte_orientable(element)
+            self._p_rotation.setValue(0.0 if angle is None else angle)
             self._p_texte.setText(metier.texte_de(element))
             self._p_champ.setChecked(nature == 'champ')
             self._p_taille.setValue(self.gabarit.taille_police(element))
@@ -569,6 +685,16 @@ class Fenetre(QtWidgets.QMainWindow):
             cles += ['prop_largeur', 'prop_hauteur']
             self._p_l.setValue(metier.nombre(element.getAttribute('width')))
             self._p_h.setValue(metier.nombre(element.getAttribute('height')))
+        if nature == 'image':
+            cles.append('prop_proportions')
+        if nature == 'image' and self._p_proportions.isChecked():
+            # la note dit ce que fera la PROCHAINE cote tapée : sans objet
+            # case décochée
+            source, _rapport = _rapport_logo(element)
+            if source == 'cadre':
+                self._p_aide.setText(tr('aide_proportions_cadre'))
+            elif source is None:
+                self._p_aide.setText(tr('aide_proportions_aucune'))
         if nature in ('rect', 'trait', 'cercle'):
             epaisseur = metier.propriete_heritee(element, 'stroke-width')
             if epaisseur is not None:
@@ -577,6 +703,10 @@ class Fenetre(QtWidgets.QMainWindow):
         if nature == 'groupe':
             self._p_aide.setText(tr('aide_groupe'))
         self._montrer(cles)
+        if rotation_grisee:
+            self._p_rotation.setEnabled(False)
+        self._p_rotation.setToolTip(
+            tr('aide_rotation_impossible') if rotation_grisee else '')
 
     # -- application des propriétés ----------------------------------------
 
@@ -628,7 +758,9 @@ class Fenetre(QtWidgets.QMainWindow):
     # trois décimales, et réécrire les autres grandeurs à partir d'elles
     # arrondirait des valeurs que l'utilisateur n'a pas touchées (relecture
     # indépendante, 11/11/2026 : x="12.34567" devenu 12.346 après une
-    # saisie de Y).
+    # saisie de Y). Seule exception, voulue : un logo dont la case « Garder
+    # les proportions » est cochée reçoit aussi l'autre cote, calculée depuis
+    # la cote TAPÉE et le rapport de l'image (`_appliquer_cote`).
 
     def _appliquer_position(self, axe):
         element = self._seul()
@@ -679,6 +811,28 @@ class Fenetre(QtWidgets.QMainWindow):
         if abs(zone.value() - metier.nombre(
                 element.getAttribute(attribut))) < _ECART_AFFICHAGE:
             return
+        if (metier.nature(element) == 'image'
+                and self._p_proportions.isChecked()):
+            _source, rapport = _rapport_logo(element)
+            if rapport is not None:
+                # la cote tapée s'écrit telle quelle, l'autre se calcule
+                # depuis elle — jamais depuis la valeur arrondie de l'autre
+                # zone ; X et Y ne bougent pas (coin haut-gauche fixe) ; un
+                # seul geste, donc un seul Ctrl+Z pour les deux cotes
+                largeur, hauteur = metier.cotes_proportionnees(
+                    attribut, zone.value(), rapport)
+
+                def poser(e):
+                    texte_l, texte_h = metier.fmt(largeur), metier.fmt(hauteur)
+                    if not (float(texte_l) > 0 and float(texte_h) > 0):
+                        # arrondie à l'écriture (6 décimales), l'autre cote
+                        # serait nulle : le logo disparaîtrait
+                        raise metier.Refus('err_proportions_nulle')
+                    e.setAttribute('width', texte_l)
+                    e.setAttribute('height', texte_h)
+
+                self._modifier_seul(poser)
+                return
         self._modifier_seul(lambda e: e.setAttribute(
             attribut, metier.fmt(zone.value())))
 
@@ -698,6 +852,18 @@ class Fenetre(QtWidgets.QMainWindow):
     def _appliquer_ancre(self):
         self._modifier_seul(lambda e: metier.definir_propriete(
             e, 'text-anchor', self._p_ancre.currentData()))
+
+    def _appliquer_rotation(self):
+        element = self._seul()
+        if self._remplissage or element is None:
+            return
+        angle = self._p_rotation.value()
+        actuel = metier.angle_texte(element)
+        # 270 tapé sur un texte à -90 : même orientation, aucun geste
+        if actuel is not None and abs(
+                metier._normaliser_angle(angle - actuel)) < 1e-6:
+            return
+        self._modifier_seul(lambda e: metier.orienter_texte(e, angle))
 
     def _appliquer_epaisseur(self):
         self._modifier_seul(lambda e: metier.definir_propriete(
@@ -736,7 +902,8 @@ class Fenetre(QtWidgets.QMainWindow):
         if self._seul() is None:
             return
         for zone in (self._p_x, self._p_y, self._p_x2, self._p_y2, self._p_l,
-                     self._p_h, self._p_taille, self._p_trait):
+                     self._p_h, self._p_taille, self._p_trait,
+                     self._p_rotation):
             if zone.isVisible():
                 # relit le texte tapé ; `valueChanged` n'est émis que s'il
                 # diffère de la valeur, et applique alors la grandeur
@@ -826,16 +993,13 @@ class Fenetre(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, tr('titre'), tr(
                 'err_lecture', chemin=chemin, detail=str(erreur)))
             return
-        if mime == 'image/svg+xml':
-            taille = QtSvg.QSvgRenderer(QtCore.QByteArray(octets)).defaultSize()
-        else:
-            taille = QtGui.QImage.fromData(octets).size()
-        if taille.width() <= 0 or taille.height() <= 0:
+        largeur_propre, hauteur_propre = _taille_image(mime, octets)
+        if largeur_propre <= 0 or hauteur_propre <= 0:
             QtWidgets.QMessageBox.warning(self, tr('titre'), tr(
                 'err_image_illisible', chemin=chemin))
             return
         largeur = 30.0 / self.gabarit.unite_mm()
-        hauteur = largeur * taille.height() / float(taille.width())
+        hauteur = largeur * hauteur_propre / largeur_propre
         x, y = self._ici()
         self._geste(lambda: [self.gabarit.ajouter_image(
             x - largeur / 2.0, y - hauteur / 2.0, largeur, hauteur, mime,
@@ -1067,13 +1231,125 @@ class Fenetre(QtWidgets.QMainWindow):
             return
         nom, paysage = dialogue.valeurs()
 
+        bilan = {}
+
         def geste():
-            cadre.changer_format(self.gabarit, nom, paysage)
+            bilan.update(cadre.transposer(self.gabarit, nom, paysage,
+                                          _mesureur(self.gabarit)))
             return []
 
         if self._geste(geste):
             self.apercu.cadrer()
-            self._annoncer_debordements()
+            # les textes de marge sont hors du cadre EXPRÈS : seuls les
+            # débordements relevés par `transposer` sont annoncés
+            lignes = _lignes_transposition(bilan)
+            if lignes:
+                QtWidgets.QMessageBox.information(
+                    self, tr('titre'), '\n'.join(lignes))
+
+    def enregistrer_famille(self):
+        """Enregistre le template dans les dix formats A4 à A0, portrait et
+        paysage, à côté du fichier ouvert (dans le dossier de l'utilisateur
+        pour un template de FreeCAD ou pas encore enregistré). Le template
+        ouvert n'est pas modifié ; chaque format part de lui."""
+        self._valider_saisie()
+        if not cadre.est_structure(self.gabarit):
+            QtWidgets.QMessageBox.information(
+                self, tr('titre'), tr('info_pas_structure'))
+            return
+        try:
+            if self.chemin and not self._est_protege(self.chemin):
+                dossier = os.path.dirname(self.chemin)
+                base = os.path.splitext(os.path.basename(self.chemin))[0]
+            else:
+                dossier = liaison.assurer_dossier(liaison.dossier_utilisateur())
+                base = (os.path.splitext(os.path.basename(self.chemin))[0]
+                        if self.chemin else '')
+            suffixe = cadre.suffixe_famille(base)
+            source = self.gabarit.texte()
+            plan = []
+            for nom, paysage in cadre.formats_famille():
+                gabarit = metier.Gabarit.depuis_texte(source)
+                bilan = cadre.transposer(gabarit, nom, paysage,
+                                         _mesureur(gabarit))
+                fichier = cadre.nom_fichier_famille(suffixe, nom, paysage)
+                plan.append((fichier, os.path.join(dossier, fichier),
+                             gabarit, bilan))
+        except metier.Refus as refus:
+            QtWidgets.QMessageBox.warning(
+                self, tr('titre'), _message_refus(refus))
+            return
+        constats = self.gabarit.anomalies()
+        if constats:
+            lignes = '\n'.join('• ' + tr(cle, **arguments)
+                               for cle, arguments in constats)
+            reponse = QtWidgets.QMessageBox.question(
+                self, tr('titre'), tr('q_anomalies', liste=lignes),
+                QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel)
+            if reponse != QtWidgets.QMessageBox.Save:
+                return
+        # le fichier ouvert n'est jamais réécrit par la famille : il
+        # s'enregistre par Ctrl+S, et sa transposition vers son propre
+        # format reconstruirait son cadre
+        ouvert = [fichier for fichier, chemin, _g, _b in plan
+                  if self.chemin and os.path.normcase(os.path.abspath(chemin))
+                  == os.path.normcase(os.path.abspath(self.chemin))]
+        existants = [fichier for fichier, chemin, _g, _b in plan
+                     if os.path.exists(chemin) and fichier not in ouvert]
+
+        def etat(fichier):
+            if fichier in ouvert:
+                return '  ' + tr('famille_ouvert')
+            return '  ' + tr('famille_existe') if fichier in existants else ''
+
+        liste = '\n'.join('• ' + fichier + etat(fichier)
+                          for fichier, _c, _g, _b in plan)
+        boite = QtWidgets.QMessageBox(self)
+        boite.setWindowTitle(tr('titre'))
+        boite.setIcon(QtWidgets.QMessageBox.Question)
+        question = tr('q_famille', compte=len(plan), dossier=dossier,
+                      liste=liste)
+        if self.modifie:
+            # les neuf autres formats partent du template EN MÉMOIRE
+            question += '\n\n' + tr('famille_non_enregistre')
+        boite.setText(question)
+        tout = boite.addButton(
+            tr('btn_famille_remplacer') if existants else tr('btn_famille'),
+            QtWidgets.QMessageBox.AcceptRole)
+        sans = (boite.addButton(tr('btn_famille_sans_remplacer'),
+                                QtWidgets.QMessageBox.AcceptRole)
+                if existants else None)
+        boite.addButton(QtWidgets.QMessageBox.Cancel)
+        executer(boite)
+        clique = boite.clickedButton()
+        if clique is not tout and (sans is None or clique is not sans):
+            return
+        ecrits, gardes, erreurs, details = [], [], [], []
+        for fichier, chemin, gabarit, bilan in plan:
+            if fichier in ouvert or (clique is sans and fichier in existants):
+                gardes.append(fichier)
+                continue
+            if self._est_protege(chemin):
+                erreurs.append(tr('err_dossier_protege', chemin=chemin))
+                continue
+            try:
+                gabarit.ecrire(chemin)
+            except OSError as erreur:
+                erreurs.append(tr('err_ecriture', chemin=chemin,
+                                  detail=str(erreur)))
+                continue
+            ecrits.append(fichier)
+            for ligne in _lignes_transposition(bilan):
+                details.append('%s — %s' % (fichier, ligne))
+        message = [tr('info_famille', compte=len(ecrits), dossier=dossier)]
+        if gardes:
+            message.append(tr('famille_gardes', liste=', '.join(gardes)))
+        message += details + erreurs
+        (QtWidgets.QMessageBox.warning if erreurs
+         else QtWidgets.QMessageBox.information)(
+            self, tr('titre'), '\n\n'.join(message))
+        self.statusBar().showMessage(message[0], 8000)
 
     def inserer_cartouche(self):
         self._valider_saisie()
